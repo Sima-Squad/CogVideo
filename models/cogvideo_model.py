@@ -497,47 +497,57 @@ class CogVideoModel(BaseModel):
         )
         return position_embeddings
         
-    def attention_forward(self, hidden_states, mask, layer_id, **kw_args):
-        # mask.shape=[bs, 1, 1, 64]
-        if not self.mask_initialized:
-            self.attention_mask_local_sequential = self.attention_mask_local_sequential.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            self.attention_mask_local_interp = self.attention_mask_local_interp.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            self.mask_initialized = True
-        
-        attn_module = self.transformer.layers[layer_id].attention
-        hidden_size = hidden_states.shape[-1]
-        bs = hidden_states.shape[0]
-        
-        # base model qkv
-        mixed_raw_layer = attn_module.query_key_value(hidden_states)
-        q0, k0, v0 = split_tensor_along_last_dim(mixed_raw_layer, 3)
-        dropout_fn = self.transformer.layers[layer_id].attention.attention_dropout if self.training else None
+def attention_forward(self, hidden_states, mask, layer_id, **kw_args):
+    # mask.shape=[bs, 1, 1, 64]
+    if not self.mask_initialized:
+        self.attention_mask_local_sequential = self.attention_mask_local_sequential.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        self.attention_mask_local_interp = self.attention_mask_local_interp.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        self.mask_initialized = True
+    
+    attn_module = self.transformer.layers[layer_id].attention
+    hidden_size = hidden_states.shape[-1]
+    bs = hidden_states.shape[0]
+    
+    # base model qkv
+    mixed_raw_layer = attn_module.query_key_value(hidden_states)
+    q0, k0, v0 = split_tensor_along_last_dim(mixed_raw_layer, 3)
+    dropout_fn = self.transformer.layers[layer_id].attention.attention_dropout if self.training else None
 
-        attention_mask_local = self.attention_mask_local_sequential if self.mode_sequential else self.attention_mask_local_interp
-        context_text, context_frame_local_text = attention_localframe_and_text(
-                q0, k0, v0,
-                attention_mask_totxt=mask,
-                attention_mask_local=attention_mask_local,
-                n_head=attn_module.num_attention_heads_per_partition,
-                text_len=self.layout[0],
-                frame_len=self.layout[1]-self.layout[0],
-                frame_num=(self.layout[2]-self.layout[0])//(self.layout[1]-self.layout[0]),
-                attention_dropout=dropout_fn, 
-                layer_id=layer_id,
-            )
+    attention_mask_local = self.attention_mask_local_sequential if self.mode_sequential else self.attention_mask_local_interp
+    context_text, context_frame_local_text = attention_localframe_and_text(
+            q0, k0, v0,
+            attention_mask_totxt=mask,
+            attention_mask_local=attention_mask_local,
+            n_head=attn_module.num_attention_heads_per_partition,
+            text_len=self.layout[0],
+            frame_len=self.layout[1]-self.layout[0],
+            frame_num=(self.layout[2]-self.layout[0])//(self.layout[1]-self.layout[0]),
+            attention_dropout=dropout_fn, 
+            layer_id=layer_id,
+        )
 
-        context_frame_swin = self.get_mixin('attention_plus').attention_extra(
-            hidden_states[:, self.layout[0]:], layer_id, dropout_fn, 
-            text_hidden_state=hidden_states[:, :self.layout[0]], 
-            text_attn_mask=mask[..., 0, :],
-            mode_sequential=self.mode_sequential)
-            
-        attn_distrib = torch.sigmoid(self.get_mixin('attention_plus').attn_distribution[layer_id])
-        attn_distrib = attn_distrib.unsqueeze(0).unsqueeze(0)
+    context_frame_swin = self.get_mixin('attention_plus').attention_extra(
+        hidden_states[:, self.layout[0]:], layer_id, dropout_fn, 
+        text_hidden_state=hidden_states[:, :self.layout[0]], 
+        text_attn_mask=mask[..., 0, :],
+        mode_sequential=self.mode_sequential)
         
-        output_text = attn_module.dense(context_text)
-        output_frame = torch.mul(attn_module.dense(context_frame_local_text), attn_distrib)\
-            +torch.mul(self.get_mixin('attention_plus').dense[layer_id](context_frame_swin), 1-attn_distrib)
-        output = torch.cat((output_text, output_frame), dim=-2)
+    attn_distrib = torch.sigmoid(self.get_mixin('attention_plus').attn_distribution[layer_id])
+    attn_distrib = attn_distrib.unsqueeze(0).unsqueeze(0)
+    
+    # + additional channels for noise prediction
+    output_text = attn_module.dense(context_text)
+    output_frame_clean = attn_module.dense(context_frame_local_text)
+    output_frame_noise = self.get_mixin('attention_plus').dense[layer_id](context_frame_swin)
+    
+    output_frame = torch.cat((output_frame_clean, output_frame_noise), dim=-1)  # Concatenating the clean and noise channels
 
-        return output
+    # compressibility for clean frames only
+    compressibility_measure = output_frame_clean
+    
+    # visual fidelity with clean frames + predicted noise
+    visual_fidelity_measure = torch.mul(output_frame_clean, attn_distrib) + torch.mul(output_frame_noise, 1 - attn_distrib)
+
+    output = torch.cat((output_text, visual_fidelity_measure), dim=-2)
+
+    return output, compressibility_measure, visual_fidelity_measure
